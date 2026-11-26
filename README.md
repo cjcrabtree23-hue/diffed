@@ -1,36 +1,55 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Diffed
 
-## Getting Started
+**Rank it. Prove it. Diff 'em.** Tier lists with receipts: rank anything, pass a Larp Check to certify your picks, and see how far your taste is from everyone else's.
 
-First, run the development server:
+This is the Phase 1 starting point: a working tier editor and Larp Check, with no accounts or database yet.
+
+## Run it
+
+You need [Node.js](https://nodejs.org) 20 or newer.
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000, pick a template, and start ranking.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## What works now
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- **Tier editor**: drag items into True Peak, Peak, Valid, Mid, Cooked or Never Peak. On a phone, tap an item and then tap a tier name.
+- **Larp Check**: select Attack on Titan or Steins;Gate to take a 5-question quiz (20 seconds per question, 4 of 5 to pass). Passing marks the placement **Certified**. Failing shows **Larp detected** and starts a 24-hour cooldown.
+- **Your diff vs. the community**: shows how far your placements are from the community ranking, and your hottest take.
+- **Saved in this browser**: your take is kept in localStorage until accounts exist.
 
-## Learn More
+The community rankings and the two templates are **sample data** in `src/data/templates.ts`.
 
-To learn more about Next.js, take a look at the following resources:
+## Project layout
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```
+src/
+  app/
+    layout.tsx           site shell, fonts, header
+    page.tsx             home: template list
+    t/[slug]/page.tsx    a template's tier editor
+    globals.css          the Diffed look (dark, acid-lime accent)
+  components/
+    TierEditor.tsx       drag-and-drop board, tap-to-place, diff stats
+    LarpCheck.tsx        quiz flow, timer, pass/fail
+    SiteHeader.tsx
+  data/templates.ts      sample templates, quiz questions, community data
+  lib/
+    tiers.ts             tier names and colors, Larp Check rules
+    types.ts             shared types
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Next steps (Phase 1)
 
-## Deploy on Vercel
+1. **Accounts and database**: Supabase (Postgres + auth with Google/Discord sign-in). Move placements, certifications and cooldowns from localStorage to tables (see the data model in the product spec).
+2. **Real templates**: an importer that builds official templates from TMDB, IGDB and AniList, with attribution.
+3. **Community ranking**: compute real averages from everyone's placements, with certified placements weighted higher.
+4. **Profiles, follows and feed.**
+5. **Share images**: generate a clean PNG of a tier list for Stories, X and Discord.
+6. **Deploy**: push to GitHub, then import the repo into Vercel.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Larp Check cooldowns are only enforced in the browser for now. Real enforcement moves to the server once accounts exist.
