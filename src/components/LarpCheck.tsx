@@ -1,69 +1,99 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Item, QuizQuestion } from "@/lib/types";
+import Link from "next/link";
+import { createClient } from "@/lib/supabase/client";
+import type { Item, LarpQuestion } from "@/lib/types";
 import { PASS_MARK, QUIZ_LENGTH, SECONDS_PER_QUESTION } from "@/lib/tiers";
 
 type Props = {
   item: Item;
   tierName: string | null;
+  signedIn: boolean;
+  loginHref: string;
   certified: boolean;
   cooldownUntil: number | null;
   now: number;
   onPass: () => void;
-  onFail: () => void;
+  onFail: (cooldownUntil: number) => void;
 };
 
-type Phase = "intro" | "question" | "result";
+type Phase = "intro" | "loading" | "question" | "submitting" | "result";
+type Result = { score: number; total: number; passed: boolean; timed_out: boolean; cooldown_until: string | null };
 
-function shuffle<T>(xs: T[]): T[] {
-  const a = [...xs];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+function friendlyError(message: string) {
+  if (message.startsWith("Cooldown until")) return "You're on cooldown for this one. Try again later.";
+  if (message.includes("Already certified")) return "You're already certified on this one.";
+  return message || "Something went wrong. Try again.";
 }
 
-export function LarpCheck({ item, tierName, certified, cooldownUntil, now, onPass, onFail }: Props) {
+export function LarpCheck(props: Props) {
+  const { item, tierName, signedIn, loginHref, certified, cooldownUntil, now, onPass, onFail } = props;
   const [phase, setPhase] = useState<Phase>("intro");
-  const [questions, setQuestions] = useState<QuizQuestion[]>([]);
+  const [attemptId, setAttemptId] = useState<string | null>(null);
+  const [questions, setQuestions] = useState<LarpQuestion[]>([]);
+  const [answers, setAnswers] = useState<number[]>([]);
   const [index, setIndex] = useState(0);
   const [picked, setPicked] = useState<number | null>(null);
-  const [score, setScore] = useState(0);
   const [secondsLeft, setSecondsLeft] = useState(SECONDS_PER_QUESTION);
+  const [result, setResult] = useState<Result | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const quiz = item.quiz ?? [];
   const onCooldown = cooldownUntil !== null && cooldownUntil > now;
 
-  function start() {
-    setQuestions(shuffle(quiz).slice(0, QUIZ_LENGTH));
+  async function start() {
+    setError(null);
+    setPhase("loading");
+    const supabase = createClient();
+    const { data, error } = await supabase.rpc("start_larp_check", { p_item_slug: item.slug });
+    if (error || !data?.length) {
+      setError(friendlyError(error?.message ?? "No questions found."));
+      setPhase("intro");
+      return;
+    }
+    setAttemptId(data[0].attempt_id);
+    setQuestions(data.map((q) => ({ id: q.question_id, prompt: q.prompt, options: q.options })));
+    setAnswers([]);
     setIndex(0);
-    setScore(0);
     setPicked(null);
-    setSecondsLeft(SECONDS_PER_QUESTION);
+    setSecondsLeft(data[0].seconds_per_question ?? SECONDS_PER_QUESTION);
     setPhase("question");
   }
 
-  function advance(correct: boolean) {
-    const nextScore = score + (correct ? 1 : 0);
-    setScore(nextScore);
+  async function submit(all: number[]) {
+    if (!attemptId) return;
+    setPhase("submitting");
+    const supabase = createClient();
+    const { data, error } = await supabase.rpc("submit_larp_check", { p_attempt_id: attemptId, p_answers: all });
+    if (error || !data) {
+      setError(friendlyError(error?.message ?? ""));
+      setPhase("intro");
+      return;
+    }
+    const r = data as unknown as Result;
+    setResult(r);
+    setPhase("result");
+    if (r.passed) onPass();
+    else onFail(r.cooldown_until ? Date.parse(r.cooldown_until) : Date.now() + 24 * 3_600_000);
+  }
+
+  function answer(choice: number) {
+    const all = [...answers, choice];
+    setAnswers(all);
     setPicked(null);
-    if (index + 1 >= questions.length) {
-      setPhase("result");
-      if (nextScore >= Math.min(PASS_MARK, questions.length)) onPass();
-      else onFail();
+    if (all.length >= questions.length) {
+      void submit(all);
     } else {
-      setIndex(index + 1);
+      setIndex(all.length);
       setSecondsLeft(SECONDS_PER_QUESTION);
     }
   }
 
-  // Per-question countdown; running out counts as a wrong answer.
+  // Per-question countdown; running out records no answer (-1).
   useEffect(() => {
     if (phase !== "question") return;
     const t = setTimeout(() => {
-      if (secondsLeft <= 1) advance(false);
+      if (secondsLeft <= 1) answer(-1);
       else setSecondsLeft(secondsLeft - 1);
     }, 1000);
     return () => clearTimeout(t);
@@ -81,7 +111,7 @@ export function LarpCheck({ item, tierName, certified, cooldownUntil, now, onPas
     </div>
   );
 
-  if (quiz.length === 0) {
+  if (!item.hasCheck) {
     return (
       <section className="panel" aria-live="polite">
         {header}
@@ -93,30 +123,43 @@ export function LarpCheck({ item, tierName, certified, cooldownUntil, now, onPas
     );
   }
 
-  if (certified && phase !== "result") {
+  if (phase === "result" && result) {
     return (
       <section className="panel" aria-live="polite">
         {header}
-        <p className="result-pass" style={{ margin: 0 }}>Certified. Not a larp.</p>
-        <p className="muted" style={{ margin: 0 }}>Your {item.name} placement counts extra in the community ranking.</p>
-      </section>
-    );
-  }
-
-  if (onCooldown && phase !== "result") {
-    const hours = Math.ceil(((cooldownUntil ?? 0) - now) / 3_600_000);
-    return (
-      <section className="panel" aria-live="polite">
-        {header}
-        <p className="result-fail" style={{ margin: 0 }}>Larp detected</p>
+        <p className={result.passed ? "result-pass" : "result-fail"} style={{ margin: 0 }}>
+          {result.passed ? "Certified. Not a larp." : "Larp detected"}
+        </p>
         <p className="muted" style={{ margin: 0 }}>
-          Watch it, then come back. You can retry {item.name} in about {hours}h.
+          {result.timed_out ? "Time ran out on the server clock." : `You got ${result.score} of ${result.total}.`}{" "}
+          {result.passed ? "Your placement now counts double in the community ranking." : "Retry in 24h."}
         </p>
       </section>
     );
   }
 
-  if (phase === "intro") {
+  if (certified) {
+    return (
+      <section className="panel" aria-live="polite">
+        {header}
+        <p className="result-pass" style={{ margin: 0 }}>Certified. Not a larp.</p>
+        <p className="muted" style={{ margin: 0 }}>Your {item.name} placement counts double in the community ranking.</p>
+      </section>
+    );
+  }
+
+  if (onCooldown) {
+    const hours = Math.max(1, Math.ceil(((cooldownUntil ?? 0) - now) / 3_600_000));
+    return (
+      <section className="panel" aria-live="polite">
+        {header}
+        <p className="result-fail" style={{ margin: 0 }}>Larp detected</p>
+        <p className="muted" style={{ margin: 0 }}>Watch it, then come back. You can retry {item.name} in about {hours}h.</p>
+      </section>
+    );
+  }
+
+  if (phase === "intro" || phase === "loading") {
     return (
       <section className="panel active" aria-live="polite">
         {header}
@@ -128,34 +171,37 @@ export function LarpCheck({ item, tierName, certified, cooldownUntil, now, onPas
             </>
           ) : (
             <>
-              Prove you know <strong>{item.name}</strong> before you rank it.
+              Prove you know <strong>{item.name}</strong>.
             </>
           )}
         </p>
         <p className="muted" style={{ margin: 0, fontSize: 13, lineHeight: 1.5 }}>
-          {Math.min(QUIZ_LENGTH, quiz.length)} questions, {SECONDS_PER_QUESTION}s each. Get{" "}
-          {Math.min(PASS_MARK, quiz.length)} right to be <span style={{ color: "var(--accent)" }}>Certified</span>.
-          Fail and it&apos;s a 24h cooldown.
+          {QUIZ_LENGTH} questions, {SECONDS_PER_QUESTION}s each. Get {PASS_MARK} right to be{" "}
+          <span style={{ color: "var(--accent)" }}>Certified</span>. Fail and it&apos;s a 24h cooldown.
         </p>
-        <button type="button" className="btn btn-primary" onClick={start}>
-          Start Larp Check
-        </button>
+        {error && (
+          <p role="alert" style={{ margin: 0, color: "var(--danger)" }}>
+            {error}
+          </p>
+        )}
+        {signedIn ? (
+          <button type="button" className="btn btn-primary" onClick={start} disabled={phase === "loading"}>
+            {phase === "loading" ? "Loading…" : "Start Larp Check"}
+          </button>
+        ) : (
+          <Link href={loginHref} className="btn btn-primary btn-link">
+            Sign in to take it
+          </Link>
+        )}
       </section>
     );
   }
 
-  if (phase === "result") {
-    const passed = score >= Math.min(PASS_MARK, questions.length);
+  if (phase === "submitting") {
     return (
-      <section className="panel" aria-live="polite">
+      <section className="panel active" aria-live="polite">
         {header}
-        <p className={passed ? "result-pass" : "result-fail"} style={{ margin: 0 }}>
-          {passed ? "Certified. Not a larp." : "Larp detected"}
-        </p>
-        <p className="muted" style={{ margin: 0 }}>
-          You got {score} of {questions.length}.{" "}
-          {passed ? "Your placement now shows the Certified badge." : "Retry in 24h."}
-        </p>
+        <p className="muted" style={{ margin: 0 }}>Grading…</p>
       </section>
     );
   }
@@ -189,12 +235,7 @@ export function LarpCheck({ item, tierName, certified, cooldownUntil, now, onPas
           </button>
         ))}
       </div>
-      <button
-        type="button"
-        className="btn btn-primary"
-        disabled={picked === null}
-        onClick={() => advance(picked === q.answer)}
-      >
+      <button type="button" className="btn btn-primary" disabled={picked === null} onClick={() => answer(picked!)}>
         Lock it in
       </button>
     </section>

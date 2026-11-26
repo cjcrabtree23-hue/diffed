@@ -1,25 +1,21 @@
+import { Suspense } from "react";
 import { notFound } from "next/navigation";
-import { TEMPLATES, getTemplate } from "@/data/templates";
+import { getEditorData } from "@/lib/data";
 import { TierEditor } from "@/components/TierEditor";
 
-export function generateStaticParams() {
-  return TEMPLATES.map((t) => ({ slug: t.slug }));
+async function Editor({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  const data = await getEditorData(slug);
+  if (!data) notFound();
+  return <TierEditor data={data} />;
 }
 
-export async function generateMetadata(props: PageProps<"/t/[slug]">) {
-  const { slug } = await props.params;
-  const t = getTemplate(slug);
-  return { title: t ? `${t.title} · Diffed` : "Diffed" };
-}
-
-export default async function TemplatePage(props: PageProps<"/t/[slug]">) {
-  const { slug } = await props.params;
-  const template = getTemplate(slug);
-  if (!template) notFound();
-
+export default function TemplatePage(props: PageProps<"/t/[slug]">) {
   return (
     <main className="page">
-      <TierEditor template={template} />
+      <Suspense fallback={<p className="muted">Loading…</p>}>
+        <Editor params={props.params} />
+      </Suspense>
     </main>
   );
 }

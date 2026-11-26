@@ -10,19 +10,18 @@ You need [Node.js](https://nodejs.org) 20 or newer.
 
 ```bash
 npm install
+cp .env.example .env.local   # Supabase URL + publishable key (safe to expose; row level security protects data)
 npm run dev
 ```
 
-Open http://localhost:3000, pick a template, and start ranking.
+Open http://localhost:3000, create an account, pick a template, and start ranking.
 
 ## What works now
 
-- **Tier editor**: drag items into True Peak, Peak, Valid, Mid, Cooked or Never Peak. On a phone, tap an item and then tap a tier name.
-- **Larp Check**: select Attack on Titan or Steins;Gate to take a 5-question quiz (20 seconds per question, 4 of 5 to pass). Passing marks the placement **Certified**. Failing shows **Larp detected** and starts a 24-hour cooldown.
-- **Your diff vs. the community**: shows how far your placements are from the community ranking, and your hottest take.
-- **Saved in this browser**: your take is kept in localStorage until accounts exist.
-
-The community rankings and the two templates are **sample data** in `src/data/templates.ts`.
+- **Accounts**: email + password sign-up and sign-in (Supabase Auth). New users get a profile with a unique handle.
+- **Tier editor**: drag items into True Peak, Peak, Valid, Mid, Cooked or Never Peak, or tap an item then a tier name. Signed in, every move saves to your account and is logged in your re-rank history. Signed out, the take stays in your browser and moves to your account when you sign in.
+- **Larp Check (server-graded)**: questions come from the database at random; answers never reach the browser. 20 seconds per question, 4 of 5 to pass, enforced by the server. Pass = **Certified**. Fail = **Larp detected** and a 24-hour cooldown.
+- **Community ranking**: a database view averages every public take, with certified placements counting double. The editor shows your diff and hottest take.
 
 ## Project layout
 
@@ -37,19 +36,24 @@ src/
     TierEditor.tsx       drag-and-drop board, tap-to-place, diff stats
     LarpCheck.tsx        quiz flow, timer, pass/fail
     SiteHeader.tsx
-  data/templates.ts      sample templates, quiz questions, community data
   lib/
+    data.ts              server-side data loading
+    supabase/            browser/server clients, session refresh, DB types
     tiers.ts             tier names and colors, Larp Check rules
     types.ts             shared types
+  proxy.ts               refreshes the sign-in session on each request
+supabase/migrations/     database schema, Larp Check functions, sample seed
 ```
 
-## Next steps (Phase 1)
+## Before launch
 
-1. **Accounts and database**: Supabase (Postgres + auth with Google/Discord sign-in). Move placements, certifications and cooldowns from localStorage to tables (see the data model in the product spec).
-2. **Real templates**: an importer that builds official templates from TMDB, IGDB and AniList, with attribution.
-3. **Community ranking**: compute real averages from everyone's placements, with certified placements weighted higher.
-4. **Profiles, follows and feed.**
-5. **Share images**: generate a clean PNG of a tier list for Stories, X and Discord.
-6. **Deploy**: push to GitHub, then import the repo into Vercel.
+- In Supabase → Authentication → URL Configuration, set **Site URL** to the live domain and add it to **Redirect URLs** (it is `http://localhost:3000` by default).
+- Supabase's built-in email sender only allows a few emails per hour. Add your own SMTP (e.g. Resend) under Authentication → SMTP before real users sign up.
+- Optional: Google and Discord sign-in (Authentication → Providers).
 
-Larp Check cooldowns are only enforced in the browser for now. Real enforcement moves to the server once accounts exist.
+## Next steps
+
+1. **Profiles, follows and feed** (re-rank history is already recorded).
+2. **Real templates**: importer for TMDB, IGDB and AniList, with attribution.
+3. **Share images** for Stories, X and Discord.
+4. **Deploy**: import this repo into Vercel and add the two env vars.

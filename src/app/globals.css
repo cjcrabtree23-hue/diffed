@@ -88,3 +88,11 @@ h1, h2, h3 { font-family: var(--display); margin: 0; }
   .tier-label { flex-basis: 76px; font-size: 13px; }
   .tile { width: 104px; }
 }
+
+/* Forms and notices */
+.field { display: flex; flex-direction: column; gap: 6px; font-weight: 600; font-size: 13px; }
+.field input { min-height: 44px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line-2); background: #18181c; color: var(--text); font: inherit; font-weight: 400; font-size: 15px; }
+.field input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.notice { margin: 12px 0 0; padding: 12px 14px; border: 1px solid var(--line-2); border-radius: 12px; background: var(--panel); color: #d4d4d8; }
+.btn-link { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
+.btn-link:hover { color: var(--bg); }

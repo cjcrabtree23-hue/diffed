@@ -1,23 +1,25 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import {
   DndContext,
   DragOverlay,
   KeyboardSensor,
   PointerSensor,
+  pointerWithin,
+  rectIntersection,
   useDraggable,
   useDroppable,
   useSensor,
   useSensors,
-  pointerWithin,
-  rectIntersection,
   type CollisionDetection,
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import type { Item, Placements, Template } from "@/lib/types";
-import { COOLDOWN_MS, DEFAULT_TIERS, POOL } from "@/lib/tiers";
+import { createClient } from "@/lib/supabase/client";
+import type { EditorData, Item, Placements } from "@/lib/types";
+import { DEFAULT_TIERS, POOL } from "@/lib/tiers";
 import { LarpCheck } from "./LarpCheck";
 
 // Drop where the pointer is; fall back to overlap for keyboard dragging.
@@ -26,29 +28,47 @@ const collision: CollisionDetection = (args) => {
   return hits.length ? hits : rectIntersection(args);
 };
 
-type Saved = { placements: Placements; certified: Record<string, true>; cooldowns: Record<string, number> };
+type SaveState = "idle" | "saving" | "saved" | "error";
 
-function emptyPlacements(template: Template): Placements {
-  const p: Placements = { [POOL]: template.items.map((i) => i.id) };
+function emptyPlacements(items: Item[]): Placements {
+  const p: Placements = { [POOL]: items.map((i) => i.id) };
   for (const t of DEFAULT_TIERS) p[t.id] = [];
   return p;
 }
 
-function storageKey(slug: string) {
+function fromSaved(items: Item[], saved: EditorData["saved"]): Placements {
+  const p = emptyPlacements(items);
+  const placed = new Set<string>();
+  for (const s of [...saved].sort((a, b) => a.position - b.position)) {
+    const tier = DEFAULT_TIERS[s.tier];
+    if (!tier || placed.has(s.itemId)) continue;
+    p[tier.id].push(s.itemId);
+    placed.add(s.itemId);
+  }
+  p[POOL] = items.map((i) => i.id).filter((id) => !placed.has(id));
+  return p;
+}
+
+function localKey(slug: string) {
   return `diffed:${slug}`;
 }
 
-export function TierEditor({ template }: { template: Template }) {
-  const itemsById = useMemo(() => new Map(template.items.map((i) => [i.id, i])), [template]);
-  const [placements, setPlacements] = useState<Placements>(() => emptyPlacements(template));
-  const [certified, setCertified] = useState<Record<string, true>>({});
-  const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
+export function TierEditor({ data }: { data: EditorData }) {
+  const { template, items, user } = data;
+  const itemsById = useMemo(() => new Map(items.map((i) => [i.id, i])), [items]);
+  const [placements, setPlacements] = useState<Placements>(() => fromSaved(items, data.saved));
+  const [certified, setCertified] = useState<Set<string>>(() => new Set(data.certified));
+  const [cooldowns, setCooldowns] = useState<Record<string, number>>(() =>
+    Object.fromEntries(Object.entries(data.cooldowns).map(([k, v]) => [k, Date.parse(v)])),
+  );
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [loaded, setLoaded] = useState(false);
-  // Current time for cooldowns; read only on the client, never during prerender.
+  const [saveState, setSaveState] = useState<SaveState>("idle");
   const [now, setNow] = useState(0);
+  const listIdRef = useRef<string | null>(data.listId);
+  const loadedLocal = useRef(false);
 
+  // Clock for cooldowns, read only in the browser.
   useEffect(() => {
     const tick = () => setNow(Date.now());
     const first = setTimeout(tick, 0);
@@ -59,40 +79,87 @@ export function TierEditor({ template }: { template: Template }) {
     };
   }, []);
 
-  // Restore this browser's saved take (accounts + database replace this later).
-  useEffect(() => {
+  async function ensureList(): Promise<string> {
+    if (listIdRef.current) return listIdRef.current;
+    const supabase = createClient();
+    const { data: row, error } = await supabase
+      .from("lists")
+      .upsert({ user_id: user!.id, template_id: template.id }, { onConflict: "user_id,template_id" })
+      .select("id")
+      .single();
+    if (error) throw error;
+    listIdRef.current = row.id;
+    return row.id;
+  }
+
+  async function persist(next: Placements, changed: string[]) {
+    if (!user) return;
+    setSaveState("saving");
     try {
-      const raw = localStorage.getItem(storageKey(template.slug));
-      if (raw) {
-        const saved = JSON.parse(raw) as Saved;
-        const known = new Set(template.items.map((i) => i.id));
-        const next = emptyPlacements(template);
-        const placed = new Set<string>();
-        for (const t of DEFAULT_TIERS) {
-          next[t.id] = (saved.placements?.[t.id] ?? []).filter((id) => known.has(id) && !placed.has(id));
-          next[t.id].forEach((id) => placed.add(id));
-        }
-        next[POOL] = template.items.map((i) => i.id).filter((id) => !placed.has(id));
+      const listId = await ensureList();
+      const supabase = createClient();
+      const upserts: { list_id: string; item_id: string; tier_index: number; position: number }[] = [];
+      const removals: string[] = [];
+      for (const itemId of changed) {
+        const tierIdx = DEFAULT_TIERS.findIndex((t) => next[t.id]?.includes(itemId));
+        if (tierIdx === -1) removals.push(itemId);
+        else
+          upserts.push({
+            list_id: listId,
+            item_id: itemId,
+            tier_index: tierIdx,
+            position: next[DEFAULT_TIERS[tierIdx].id].indexOf(itemId),
+          });
+      }
+      if (upserts.length) {
+        const { error } = await supabase.from("placements").upsert(upserts, { onConflict: "list_id,item_id" });
+        if (error) throw error;
+      }
+      if (removals.length) {
+        const { error } = await supabase.from("placements").delete().eq("list_id", listId).in("item_id", removals);
+        if (error) throw error;
+      }
+      setSaveState("saved");
+    } catch {
+      setSaveState("error");
+    }
+  }
+
+  // Signed out: keep the take in this browser. Signed in with nothing saved yet: bring that take along.
+  useEffect(() => {
+    if (loadedLocal.current) return;
+    loadedLocal.current = true;
+    try {
+      const raw = localStorage.getItem(localKey(template.slug));
+      if (!raw) return;
+      const local = JSON.parse(raw) as { saved: EditorData["saved"] };
+      const known = new Set(items.map((i) => i.id));
+      const saved = (local.saved ?? []).filter((s) => known.has(s.itemId));
+      if (!user) {
         // eslint-disable-next-line react-hooks/set-state-in-effect
+        setPlacements(fromSaved(items, saved));
+      } else if (data.saved.length === 0 && saved.length > 0) {
+        const next = fromSaved(items, saved);
         setPlacements(next);
-        setCertified(saved.certified ?? {});
-        setCooldowns(saved.cooldowns ?? {});
+        void persist(next, saved.map((s) => s.itemId)).then(() => localStorage.removeItem(localKey(template.slug)));
       }
     } catch {
-      /* storage unavailable: start fresh */
+      /* storage unavailable */
     }
-    setLoaded(true);
-  }, [template]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
-    if (!loaded) return;
+    if (user || !loadedLocal.current) return;
     try {
-      const data: Saved = { placements, certified, cooldowns };
-      localStorage.setItem(storageKey(template.slug), JSON.stringify(data));
+      const saved = DEFAULT_TIERS.flatMap((t, tier) =>
+        (placements[t.id] ?? []).map((itemId, position) => ({ itemId, tier, position })),
+      );
+      localStorage.setItem(localKey(template.slug), JSON.stringify({ saved }));
     } catch {
       /* ignore */
     }
-  }, [placements, certified, cooldowns, loaded, template.slug]);
+  }, [placements, user, template.slug]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -105,12 +172,24 @@ export function TierEditor({ template }: { template: Template }) {
   }
 
   function moveItem(itemId: string, toTier: string) {
-    setPlacements((prev) => {
-      const next: Placements = {};
-      for (const [k, ids] of Object.entries(prev)) next[k] = ids.filter((id) => id !== itemId);
-      next[toTier] = [...(next[toTier] ?? []), itemId];
-      return next;
-    });
+    if (tierOf(itemId) === toTier) return;
+    const next: Placements = {};
+    for (const [k, ids] of Object.entries(placements)) next[k] = ids.filter((id) => id !== itemId);
+    next[toTier] = [...(next[toTier] ?? []), itemId];
+    setPlacements(next);
+    void persist(next, [itemId]);
+  }
+
+  async function resetAll() {
+    const fresh = emptyPlacements(items);
+    setPlacements(fresh);
+    setSelectedId(null);
+    if (user && listIdRef.current) {
+      setSaveState("saving");
+      const supabase = createClient();
+      const { error } = await supabase.from("placements").delete().eq("list_id", listIdRef.current);
+      setSaveState(error ? "error" : "saved");
+    }
   }
 
   function onDragStart(e: DragStartEvent) {
@@ -121,23 +200,18 @@ export function TierEditor({ template }: { template: Template }) {
     setActiveId(null);
     if (!e.over) return;
     const itemId = String(e.active.id);
-    const toTier = String(e.over.id);
-    if (tierOf(itemId) !== toTier) moveItem(itemId, toTier);
+    moveItem(itemId, String(e.over.id));
     setSelectedId(itemId);
-  }
-
-  function placeSelected(tierId: string) {
-    if (selectedId) moveItem(selectedId, tierId);
   }
 
   // Stats
   const placedIds = DEFAULT_TIERS.flatMap((t) => placements[t.id] ?? []);
-  const certifiedCount = placedIds.filter((id) => certified[id]).length;
+  const certifiedCount = placedIds.filter((id) => certified.has(id)).length;
   const diffs = placedIds
-    .filter((id) => template.community[id] !== undefined)
+    .filter((id) => data.community[id] !== undefined)
     .map((id) => {
       const mine = DEFAULT_TIERS.findIndex((t) => placements[t.id]?.includes(id));
-      return { id, mine, theirs: template.community[id], gap: Math.abs(mine - template.community[id]) };
+      return { id, mine, theirs: data.community[id], gap: Math.abs(mine - data.community[id]) };
     });
   const maxGap = DEFAULT_TIERS.length - 1;
   const diffPct = diffs.length
@@ -148,6 +222,18 @@ export function TierEditor({ template }: { template: Template }) {
   const selected = selectedId ? itemsById.get(selectedId) ?? null : null;
   const selectedTier = selected ? DEFAULT_TIERS.find((t) => t.id === tierOf(selected.id)) ?? null : null;
   const active = activeId ? itemsById.get(activeId) ?? null : null;
+  const loginHref = `/login?next=${encodeURIComponent(`/t/${template.slug}`)}`;
+
+  const tile = (id: string) => (
+    <Tile
+      key={id}
+      item={itemsById.get(id)!}
+      certified={certified.has(id)}
+      onCooldown={(cooldowns[id] ?? 0) > now}
+      selected={selectedId === id}
+      onSelect={() => setSelectedId(id)}
+    />
+  );
 
   return (
     <>
@@ -158,29 +244,42 @@ export function TierEditor({ template }: { template: Template }) {
           </p>
           <h1 style={{ fontSize: 34, letterSpacing: -0.5 }}>{template.title}</h1>
           <p className="muted" style={{ margin: "6px 0 0" }}>
-            Your take · {placedIds.length} of {template.items.length} placed ·{" "}
+            {user ? `@${user.handle}'s take` : "Your take"} · {placedIds.length} of {items.length} placed ·{" "}
             <span style={{ color: "var(--accent)", fontWeight: 600 }}>{certifiedCount} certified</span>
+            {user && (
+              <span aria-live="polite">
+                {saveState === "saving" && " · Saving…"}
+                {saveState === "saved" && " · Saved"}
+                {saveState === "error" && <span style={{ color: "var(--danger)" }}> · Couldn&apos;t save. Try again.</span>}
+              </span>
+            )}
           </p>
         </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => {
-              setPlacements(emptyPlacements(template));
-              setSelectedId(null);
-            }}
-          >
+          <button type="button" className="btn" onClick={resetAll}>
             Reset
           </button>
-          <button type="button" className="btn btn-primary" disabled title="Posting arrives with accounts">
+          <button type="button" className="btn btn-primary" disabled title="Posting to the feed is coming next">
             Post take
           </button>
         </div>
       </div>
 
+      {!user && (
+        <p className="notice">
+          This take is only saved in this browser. <Link href={loginHref}>Sign in</Link> to save it to your account
+          and take Larp Checks.
+        </p>
+      )}
+
       <div className="editor">
-        <DndContext sensors={sensors} collisionDetection={collision} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragCancel={() => setActiveId(null)}>
+        <DndContext
+          sensors={sensors}
+          collisionDetection={collision}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+          onDragCancel={() => setActiveId(null)}
+        >
           <section className="editor-main" aria-label="Tier list">
             <p className="muted" style={{ margin: 0, fontSize: 13 }}>
               Drag items into tiers, or tap an item and then tap a tier name.
@@ -192,23 +291,12 @@ export function TierEditor({ template }: { template: Template }) {
                     type="button"
                     className="tier-label"
                     style={{ background: tier.color }}
-                    onClick={() => placeSelected(tier.id)}
+                    onClick={() => selectedId && moveItem(selectedId, tier.id)}
                     aria-label={selected ? `Move ${selected.name} to ${tier.name}` : tier.name}
                   >
                     {tier.name}
                   </button>
-                  <DropZone id={tier.id}>
-                    {(placements[tier.id] ?? []).map((id) => (
-                      <Tile
-                        key={id}
-                        item={itemsById.get(id)!}
-                        certified={!!certified[id]}
-                        onCooldown={(cooldowns[id] ?? 0) > now}
-                        selected={selectedId === id}
-                        onSelect={() => setSelectedId(id)}
-                      />
-                    ))}
-                  </DropZone>
+                  <DropZone id={tier.id}>{(placements[tier.id] ?? []).map(tile)}</DropZone>
                 </div>
               ))}
             </div>
@@ -217,18 +305,7 @@ export function TierEditor({ template }: { template: Template }) {
               <p className="muted" style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 600 }}>
                 Not ranked yet ({placements[POOL]?.length ?? 0})
               </p>
-              <DropZone id={POOL}>
-                {(placements[POOL] ?? []).map((id) => (
-                  <Tile
-                    key={id}
-                    item={itemsById.get(id)!}
-                    certified={!!certified[id]}
-                    onCooldown={(cooldowns[id] ?? 0) > now}
-                    selected={selectedId === id}
-                    onSelect={() => setSelectedId(id)}
-                  />
-                ))}
-              </DropZone>
+              <DropZone id={POOL}>{(placements[POOL] ?? []).map(tile)}</DropZone>
             </div>
           </section>
 
@@ -247,15 +324,13 @@ export function TierEditor({ template }: { template: Template }) {
               key={selected.id}
               item={selected}
               tierName={selectedTier?.name ?? null}
-              certified={!!certified[selected.id]}
+              signedIn={!!user}
+              loginHref={loginHref}
+              certified={certified.has(selected.id)}
               cooldownUntil={cooldowns[selected.id] ?? null}
               now={now}
-              onPass={() => setCertified((c) => ({ ...c, [selected.id]: true }))}
-              onFail={() => {
-                const t = Date.now();
-                setNow(t);
-                setCooldowns((c) => ({ ...c, [selected.id]: t + COOLDOWN_MS }));
-              }}
+              onPass={() => setCertified((c) => new Set(c).add(selected.id))}
+              onFail={(until) => setCooldowns((c) => ({ ...c, [selected.id]: until }))}
             />
           ) : (
             <section className="panel">
@@ -268,7 +343,11 @@ export function TierEditor({ template }: { template: Template }) {
 
           <section className="panel">
             <h2 style={{ fontSize: 16 }}>Your diff vs. the community</h2>
-            {diffPct === null ? (
+            {data.communityTakes === 0 ? (
+              <p className="muted" style={{ margin: 0 }}>
+                No community takes yet. Yours could be the first.
+              </p>
+            ) : diffPct === null ? (
               <p className="muted" style={{ margin: 0 }}>Place a few items to see your diff.</p>
             ) : (
               <>
@@ -285,7 +364,9 @@ export function TierEditor({ template }: { template: Template }) {
                     {DEFAULT_TIERS[hotTakes[0].theirs].name}.
                   </p>
                 )}
-                <p className="muted" style={{ margin: 0, fontSize: 11 }}>Community numbers are sample data for now.</p>
+                <p className="muted" style={{ margin: 0, fontSize: 11 }}>
+                  From {data.communityTakes} take{data.communityTakes === 1 ? "" : "s"}. Certified picks count double.
+                </p>
               </>
             )}
           </section>
@@ -337,7 +418,7 @@ function Tile({
       ) : onCooldown ? (
         <span className="tile-status bad">Larp detected</span>
       ) : (
-        <span className="tile-status">{item.quiz ? "Unverified" : "No check yet"}</span>
+        <span className="tile-status">{item.hasCheck ? "Unverified" : "No check yet"}</span>
       )}
     </button>
   );
